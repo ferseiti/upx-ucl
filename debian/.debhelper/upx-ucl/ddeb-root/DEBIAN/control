@@ -1,0 +1,14 @@
+Package: upx-ucl-dbgsym
+Source: upx-ucl
+Version: 3.91-1
+Architecture: ppc64el
+Maintainer: Robert Luberda <robert@debian.org>
+Installed-Size: 1245
+Depends: upx-ucl (= 3.91-1)
+Built-Using: lzma (= 9.22-2)
+Section: debug
+Priority: extra
+Homepage: http://upx.sourceforge.net/
+Description: Debug symbols for upx-ucl
+Auto-Built-Package: debug-symbols
+Build-Ids: bca22744f20f4692e3a991360477ad0dbebb521c

@@ -1,0 +1,860 @@
+Description: Adding ppc64 packaging
+--- upx-ucl-3.91.orig/src/conf.h
++++ upx-ucl-3.91/src/conf.h
+@@ -506,6 +506,11 @@ private:
+ 
+ #define UPX_F_WIN64_PEP         36
+ 
++#define UPX_F_MACH_PPC64        37
++#define UPX_F_LINUX_ELFPPC64    38
++#define UPX_F_VMLINUX_PPC64     39
++#define UPX_F_DYLIB_PPC64       40
++
+ #define UPX_F_PLAIN_TEXT        127
+ 
+ #define UPX_F_ATARI_TOS         129
+--- upx-ucl-3.91.orig/src/linker.cpp
++++ upx-ucl-3.91/src/linker.cpp
+@@ -868,6 +868,44 @@ void ElfLinkerPpc32::relocate1(const Rel
+         super::relocate1(rel, location, value, type);
+ }
+ 
++void ElfLinkerPpc64::relocate1(const Relocation *rel, upx_byte *location,
++                               upx_uint64_t value, const char *type)
++{
++    if (strncmp(type, "R_PPC64_", 9))
++        return super::relocate1(rel, location, value, type);
++    type += 9;
++
++    bool range_check = false;
++    if (strncmp(type, "PC", 2) == 0)
++    {
++        value -= rel->section->offset + rel->offset;
++        type += 2;
++        range_check = true;
++    }
++
++    if (strcmp(type, "8") == 0)
++    {
++#if (ACC_CC_PGI)
++        int displ = * (signed char *) location + (int) value; // CBUG
++#else
++        int displ = (signed char) *location + (int) value;
++#endif
++        if (range_check && (displ < -128 || displ > 127))
++            internal_error("target out of range (%d) in reloc %s:%x\n",
++                           displ, rel->section->name, rel->offset);
++        *location += value;
++    }
++    else if (strcmp(type, "16") == 0)
++        set_le16(location, get_le16(location) + value);
++    else if (strncmp(type, "32", 2) == 0)  // for "32" and "32S"
++        set_le32(location, get_le32(location) + value);
++    else if (strcmp(type, "64") == 0)
++        set_le64(location, get_le64(location) + value);
++    else
++        super::relocate1(rel, location, value, type);
++}
++
++
+ 
+ void ElfLinkerX86::relocate1(const Relocation *rel, upx_byte *location,
+                              upx_uint64_t value, const char *type)
+--- upx-ucl-3.91.orig/src/linker.h
++++ upx-ucl-3.91/src/linker.h
+@@ -234,6 +234,15 @@ protected:
+ };
+ 
+ 
++class ElfLinkerPpc64 : public ElfLinker
++{
++    typedef ElfLinker super;
++protected:
++    virtual void relocate1(const Relocation *, upx_byte *location,
++                           upx_uint64_t value, const char *type);
++};
++
++
+ class ElfLinkerX86 : public ElfLinker
+ {
+     typedef ElfLinker super;
+--- upx-ucl-3.91.orig/src/p_lx_elf.cpp
++++ upx-ucl-3.91/src/p_lx_elf.cpp
+@@ -545,6 +545,16 @@ PackLinuxElf32ppc::getFilters() const
+ }
+ 
+ int const *
++PackLinuxElf64ppc::getFilters() const
++{
++    static const int filters[] = {
++        0xd0,
++    FT_END };
++    return filters;
++}
++
++
++int const *
+ PackLinuxElf64amd::getFilters() const
+ {
+     static const int filters[] = {
+@@ -618,6 +628,25 @@ Linker* PackLinuxElf32ppc::newLinker() c
+     return new ElfLinkerPpc32;
+ }
+ 
++PackLinuxElf64ppc::PackLinuxElf64ppc(InputFile *f)
++    : super(f)
++{
++    e_machine = Elf64_Ehdr::EM_PPC64;
++    ei_class  = Elf64_Ehdr::ELFCLASS64;
++    ei_data   = Elf64_Ehdr::ELFDATA2LSB;
++    ei_osabi  = Elf64_Ehdr::ELFOSABI_LINUX;
++}
++
++PackLinuxElf64ppc::~PackLinuxElf64ppc()
++{
++}
++
++Linker* PackLinuxElf64ppc::newLinker() const
++{
++    return new ElfLinkerPpc64;
++}
++
++
+ PackLinuxElf64amd::PackLinuxElf64amd(InputFile *f)
+     : super(f)
+ {
+@@ -1142,6 +1171,15 @@ PackLinuxElf32ppc::buildLoader(const Fil
+         stub_powerpc_linux_elf_fold,  sizeof(stub_powerpc_linux_elf_fold), ft);
+ }
+ 
++void
++PackLinuxElf64ppc::buildLoader(const Filter *ft)
++{
++    buildLinuxLoader(
++        stub_powerpc_linux_elf_entry, sizeof(stub_powerpc_linux_elf_entry),
++        stub_powerpc_linux_elf_fold,  sizeof(stub_powerpc_linux_elf_fold), ft);
++}
++
++
+ static const
+ #include "stub/amd64-linux.elf-entry.h"
+ static const
+@@ -1635,6 +1673,184 @@ proceed:
+     return true;
+ }
+ 
++bool
++PackLinuxElf64ppc::canPack()
++{
++    union {
++        unsigned char buf[sizeof(Elf64_Ehdr) + 14*sizeof(Elf64_Phdr)];
++        //struct { Elf64_Ehdr ehdr; Elf64_Phdr phdr; } e;
++    } u;
++    COMPILE_TIME_ASSERT(sizeof(u) <= 1024)
++
++    fi->readx(u.buf, sizeof(u.buf));
++    fi->seek(0, SEEK_SET);
++    Elf64_Ehdr const *const ehdr = (Elf64_Ehdr *) u.buf;
++
++    // now check the ELF header
++    if (checkEhdr(ehdr) != 0)
++        return false;
++
++    // additional requirements for linux/elf386
++    if (get_te16(&ehdr->e_ehsize) != sizeof(*ehdr)) {
++        throwCantPack("invalid Ehdr e_ehsize; try '--force-execve'");
++        return false;
++    }
++    upx_uint64_t const e_shoff = get_te64(&ehdr->e_shoff);
++    upx_uint64_t const e_phoff = get_te64(&ehdr->e_phoff);
++    if (e_phoff != sizeof(*ehdr)) {// Phdrs not contiguous with Ehdr
++        throwCantPack("non-contiguous Ehdr/Phdr; try '--force-execve'");
++        return false;
++    }
++
++    // The first PT_LOAD64 must cover the beginning of the file (0==p_offset).
++    Elf64_Phdr const *phdr = (Elf64_Phdr const *)(u.buf + (unsigned) e_phoff);
++    for (unsigned j=0; j < e_phnum; ++phdr, ++j) {
++        if (j >= 14)
++            return false;
++        if (phdr->PT_LOAD64 == get_te32(&phdr->p_type)) {
++            // Just avoid the "rewind" when unpacking?
++            //if (phdr->p_offset != 0) {
++            //    throwCantPack("invalid Phdr p_offset; try '--force-execve'");
++            //    return false;
++            //}
++            load_va = get_te64(&phdr->p_vaddr);
++            exetype = 1;
++            break;
++        }
++    }
++    // We want to compress position-independent executable (gcc -pie)
++    // main programs, but compressing a shared library must be avoided
++    // because the result is no longer usable.  In theory, there is no way
++    // to tell them apart: both are just ET_DYN.  Also in theory,
++    // neither the presence nor the absence of any particular symbol name
++    // can be used to tell them apart; there are counterexamples.
++    // However, we will use the following heuristic suggested by
++    // Peter S. Mazinger <ps.m@gmx.net> September 2005:
++    // If a ET_DYN has __libc_start_main as a global undefined symbol,
++    // then the file is a position-independent executable main program
++    // (that depends on libc.so.6) and is eligible to be compressed.
++    // Otherwise (no __libc_start_main as global undefined): skip it.
++    // Also allow  __uClibc_main  and  __uClibc_start_main .
++
++    if (Elf32_Ehdr::ET_DYN==get_te16(&ehdr->e_type)) {
++        // The DT_STRTAB has no designated length.  Read the whole file.
++        file_image = new char[file_size];
++        fi->seek(0, SEEK_SET);
++        fi->readx(file_image, file_size);
++        memcpy(&ehdri, ehdr, sizeof(Elf32_Ehdr));
++        phdri= (Elf64_Phdr       *)((size_t)e_phoff + file_image);  // do not free() !!
++        shdri= (Elf64_Shdr const *)((size_t)e_shoff + file_image);  // do not free() !!
++
++        n_elf_shnum = get_te16(&ehdr->e_shnum);
++        //sec_strndx = &shdri[ehdr->e_shstrndx];
++        //shstrtab = (char const *)(sec_strndx->sh_offset + file_image);
++        sec_dynsym = elf_find_section_type(Elf64_Shdr::SHT_DYNSYM);
++        if (sec_dynsym)
++            sec_dynstr = get_te32(&sec_dynsym->sh_link) + shdri;
++
++        int j= e_phnum;
++        phdr= phdri;
++        for (; --j>=0; ++phdr)
++        if (Elf64_Phdr::PT_DYNAMIC==get_te32(&phdr->p_type)) {
++            dynseg= (Elf64_Dyn const *)(get_te32(&phdr->p_offset) + file_image);
++            break;
++        }
++        // elf_find_dynamic() returns 0 if 0==dynseg.
++        dynstr=          (char const *)elf_find_dynamic(Elf64_Dyn::DT_STRTAB);
++        dynsym=     (Elf64_Sym const *)elf_find_dynamic(Elf64_Dyn::DT_SYMTAB);
++
++        // Modified 2009-10-10 to detect a ProgramLinkageTable relocation
++        // which references the symbol, because DT_GNU_HASH contains only
++        // defined symbols, and there might be no DT_HASH.
++
++        Elf64_Rela const *
++        jmprela= (Elf64_Rela const *)elf_find_dynamic(Elf64_Dyn::DT_JMPREL);
++        for (   int sz = elf_unsigned_dynamic(Elf64_Dyn::DT_PLTRELSZ);
++                0 < sz;
++                (sz -= sizeof(Elf64_Rela)), ++jmprela
++        ) {
++            unsigned const symnum = get_te64(&jmprela->r_info) >> 32;
++            char const *const symnam = get_te32(&dynsym[symnum].st_name) + dynstr;
++            if (0==strcmp(symnam, "__libc_start_main")
++            ||  0==strcmp(symnam, "__uClibc_main")
++            ||  0==strcmp(symnam, "__uClibc_start_main"))
++                goto proceed;
++        }
++
++        // Heuristic HACK for shared libraries (compare Darwin (MacOS) Dylib.)
++        // If there is an existing DT_INIT, and if everything that the dynamic
++        // linker ld-linux needs to perform relocations before calling DT_INIT
++        // resides below the first SHT_EXECINSTR Section in one PT_LOAD, then
++        // compress from the first executable Section to the end of that PT_LOAD.
++        // We must not alter anything that ld-linux might touch before it calls
++        // the DT_INIT function.
++        //
++        // Obviously this hack requires that the linker script put pieces
++        // into good positions when building the original shared library,
++        // and also requires ld-linux to behave.
++
++        if (elf_find_dynamic(Elf64_Dyn::DT_INIT)) {
++            if (elf_has_dynamic(Elf64_Dyn::DT_TEXTREL)) {
++                shdri = NULL;
++                phdri = NULL;
++                throwCantPack("DT_TEXTREL found; re-compile with -fPIC");
++                goto abandon;
++            }
++            Elf64_Shdr const *shdr = shdri;
++            xct_va = ~0ull;
++            for (j= n_elf_shnum; --j>=0; ++shdr) {
++                if (Elf64_Shdr::SHF_EXECINSTR & get_te32(&shdr->sh_flags)) {
++                    xct_va = umin64(xct_va, get_te64(&shdr->sh_addr));
++                }
++            }
++            // Rely on 0==elf_unsigned_dynamic(tag) if no such tag.
++            upx_uint64_t const va_gash = elf_unsigned_dynamic(Elf64_Dyn::DT_GNU_HASH);
++            upx_uint64_t const va_hash = elf_unsigned_dynamic(Elf64_Dyn::DT_HASH);
++            if (xct_va < va_gash  ||  (0==va_gash && xct_va < va_hash)
++            ||  xct_va < elf_unsigned_dynamic(Elf64_Dyn::DT_STRTAB)
++            ||  xct_va < elf_unsigned_dynamic(Elf64_Dyn::DT_SYMTAB)
++            ||  xct_va < elf_unsigned_dynamic(Elf64_Dyn::DT_REL)
++            ||  xct_va < elf_unsigned_dynamic(Elf64_Dyn::DT_RELA)
++            ||  xct_va < elf_unsigned_dynamic(Elf64_Dyn::DT_JMPREL)
++            ||  xct_va < elf_unsigned_dynamic(Elf64_Dyn::DT_VERDEF)
++            ||  xct_va < elf_unsigned_dynamic(Elf64_Dyn::DT_VERSYM)
++            ||  xct_va < elf_unsigned_dynamic(Elf64_Dyn::DT_VERNEEDED) ) {
++                phdri = NULL;
++                shdri = NULL;
++                throwCantPack("DT_ tag above stub");
++                goto abandon;
++            }
++            for ((shdr= shdri), (j= n_elf_shnum); --j>=0; ++shdr) {
++                upx_uint64_t const sh_addr = get_te64(&shdr->sh_addr);
++                if ( sh_addr==va_gash
++                ||  (sh_addr==va_hash && 0==va_gash) ) {
++                    shdr= &shdri[get_te32(&shdr->sh_link)];  // the associated SHT_SYMTAB
++                    hatch_off = (char *)&ehdri.e_ident[11] - (char *)&ehdri;
++                    break;
++                }
++            }
++            xct_off = elf_get_offset_from_address(xct_va);
++            goto proceed;  // But proper packing depends on checking xct_va.
++        }
++abandon:
++        phdri = 0;  // Done with this
++        return false;
++proceed:
++        phdri = 0;
++    }
++    // XXX Theoretically the following test should be first,
++    // but PackUnix::canPack() wants 0!=exetype ?
++    if (!super::canPack())
++        return false;
++    assert(exetype == 1);
++
++    exetype = 0;
++
++    // set options
++    opt->o_unix.blocksize = blocksize = file_size;
++    return true;
++}
++
+ off_t
+ PackLinuxElf32::getbrk(const Elf32_Phdr *phdr, int nph) const
+ {
+@@ -2166,6 +2382,15 @@ void PackLinuxElf32ppc::pack1(OutputFile
+     generateElfHdr(fo, stub_powerpc_linux_elf_fold, getbrk(phdri, e_phnum) );
+ }
+ 
++void PackLinuxElf64ppc::pack1(OutputFile *fo, Filter &ft)
++{
++    super::pack1(fo, ft);
++    if (0!=xct_off)  // shared library
++        return;
++    generateElfHdr(fo, stub_powerpc_linux_elf_fold, getbrk(phdri, e_phnum) );
++}
++
++
+ void PackLinuxElf64::pack1(OutputFile *fo, Filter & /*ft*/)
+ {
+     fi->seek(0, SEEK_SET);
+--- upx-ucl-3.91.orig/src/p_lx_elf.h
++++ upx-ucl-3.91/src/p_lx_elf.h
+@@ -395,6 +395,28 @@ protected:
+     virtual Linker* newLinker() const;
+ };
+ 
++/*************************************************************************
++// linux/elf64ppc
++**************************************************************************/
++
++class PackLinuxElf64ppc : public PackLinuxElf64Le
++{
++    typedef PackLinuxElf64Le super;
++public:
++    PackLinuxElf64ppc(InputFile *f);
++    virtual ~PackLinuxElf64ppc();
++    virtual int getFormat() const { return UPX_F_LINUX_ELFPPC64; }
++    virtual const char *getName() const { return "linux/ElfPPC64"; }
++    virtual const char *getFullName(const options_t *) const { return "powerpc-linux.elf"; }
++    virtual const int *getFilters() const;
++    virtual bool canPack();
++protected:
++    virtual void pack1(OutputFile *, Filter &);  // generate executable header
++    virtual void buildLoader(const Filter *);
++    virtual Linker* newLinker() const;
++};
++
++
+ 
+ /*************************************************************************
+ // linux/elf386
+--- upx-ucl-3.91.orig/src/p_mach.cpp
++++ upx-ucl-3.91/src/p_mach.cpp
+@@ -119,6 +119,11 @@ PackDylibPPC32::PackDylibPPC32(InputFile
+     my_filetype = Mach_header::MH_DYLIB;
+ }
+ 
++PackDylibPPC64::PackDylibPPC64(InputFile *f) : super(f)
++{
++    my_filetype = Mach_header::MH_DYLIB;
++}
++
+ template <class T>
+ const int *PackMachBase<T>::getCompressionMethods(int method, int level) const
+ {
+@@ -143,6 +148,17 @@ const int *PackMachPPC32::getFilters() c
+     return filters;
+ }
+ 
++PackMachPPC64::PackMachPPC64(InputFile *f) : super(f, Mach_header::CPU_TYPE_POWERPC64,
++        Mach_header::MH_EXECUTE, Mach_thread_command::PPC_THREAD_STATE64,
++        sizeof(Mach_ppc_thread_state64)>>2, sizeof(threado))
++{ }
++
++const int *PackMachPPC64::getFilters() const
++{
++    static const int filters[] = { 0xd0, FT_END };
++    return filters;
++}
++
+ PackMachI386::PackMachI386(InputFile *f) : super(f, Mach_header::CPU_TYPE_I386,
+         Mach_header::MH_EXECUTE, (unsigned)Mach_thread_command::x86_THREAD_STATE32,
+         sizeof(Mach_i386_thread_state)>>2, sizeof(threado))
+@@ -181,6 +197,11 @@ Linker *PackMachPPC32::newLinker() const
+     return new ElfLinkerPpc32;
+ }
+ 
++Linker *PackMachPPC64::newLinker() const
++{
++    return new ElfLinkerPpc64;
++}
++
+ Linker *PackMachI386::newLinker() const
+ {
+     return new ElfLinkerX86;
+@@ -290,6 +311,22 @@ void PackMachAMD64::addStubEntrySections
+     addLoader("MACHMAINY,IDENTSTR,+40,MACHMAINZ,FOLDEXEC", NULL);
+ }
+ 
++void PackMachPPC64::addStubEntrySections(Filter const * /*ft*/)
++{
++    addLoader("MACHMAINX", NULL);
++   //addLoader(getDecompressorSections(), NULL);
++    addLoader(
++        ( M_IS_NRV2E(ph.method) ? "NRV_HEAD,NRV2E,NRV_TAIL"
++        : M_IS_NRV2D(ph.method) ? "NRV_HEAD,NRV2D,NRV_TAIL"
++        : M_IS_NRV2B(ph.method) ? "NRV_HEAD,NRV2B,NRV_TAIL"
++        : M_IS_LZMA(ph.method)  ? "LZMA_ELF00,+80C,LZMA_DEC20,LZMA_DEC30"
++        : NULL), NULL);
++    if (hasLoaderSection("CFLUSH"))
++        addLoader("CFLUSH");
++    addLoader("MACHMAINY,IDENTSTR,+40,MACHMAINZ,FOLDEXEC", NULL);
++}
++
++
+ void PackMachARMEL::addStubEntrySections(Filter const * /*ft*/)
+ {
+     addLoader("MACHMAINX", NULL);
+@@ -368,6 +405,14 @@ PackMachPPC32::buildLoader(const Filter
+ }
+ 
+ void
++PackMachPPC64::buildLoader(const Filter *ft)
++{
++    buildMachLoader(
++        stub_powerpc_darwin_macho_entry, sizeof(stub_powerpc_darwin_macho_entry),
++        stub_powerpc_darwin_macho_fold,  sizeof(stub_powerpc_darwin_macho_fold),  ft );
++}
++
++void
+ PackMachI386::buildLoader(const Filter *ft)
+ {
+     buildMachLoader(
+@@ -415,6 +460,14 @@ PackDylibPPC32::buildLoader(const Filter
+         0,  0,  ft );
+ }
+ 
++void
++PackDylibPPC64::buildLoader(const Filter *ft)
++{
++    buildMachLoader(
++        stub_powerpc_darwin_dylib_entry, sizeof(stub_powerpc_darwin_dylib_entry),
++        0,  0,  ft );
++}
++
+ template <class T>
+ void PackMachBase<T>::patchLoader() { }
+ 
+@@ -520,6 +573,50 @@ void PackMachPPC32::pack4(OutputFile *fo
+     fo->rewrite(&linfo, sizeof(linfo));
+ }
+ 
++void PackMachPPC64::pack4(OutputFile *fo, Filter &ft)  // append PackHeader
++{
++    // offset of p_info in compressed file
++    overlay_offset = sizeof(mhdro) + sizeof(segZERO)
++        + sizeof(segXHDR) + sizeof(secXHDR)
++        + sizeof(segTEXT) + sizeof(secTEXT)
++        + sizeof(segLINK) + sizeof(threado) + sizeof(linfo);
++    if (my_filetype==Mach_header::MH_EXECUTE) {
++        overlay_offset += sizeof(uuid_cmd) + sizeof(linkitem);
++    }
++
++    super::pack4(fo, ft);
++    unsigned const t = fo->getBytesWritten();
++    segTEXT.filesize = t;
++    segTEXT.vmsize  += t;  // utilize GAP + NO_LAP + sz_unc - sz_cpr
++    secTEXT.offset = overlay_offset - sizeof(linfo);
++    secTEXT.addr = segTEXT.vmaddr + secTEXT.offset;
++    secTEXT.size = segTEXT.vmsize - secTEXT.offset;
++    secXHDR.offset = overlay_offset - sizeof(linfo);
++    if (my_filetype==Mach_header::MH_EXECUTE) {
++        secXHDR.offset -= sizeof(uuid_cmd) + sizeof(linkitem);
++    }
++    secXHDR.addr += secXHDR.offset;
++    unsigned foff1 = (PAGE_MASK & (~PAGE_MASK + segTEXT.filesize));
++    if (foff1 < segTEXT.vmsize)
++        foff1 += PAGE_SIZE;  // codesign disallows overhang
++    segLINK.fileoff = foff1;
++    segLINK.vmaddr = segTEXT.vmaddr + foff1;
++    fo->seek(foff1 - 1, SEEK_SET); fo->write("", 1);
++    fo->seek(sizeof(mhdro), SEEK_SET);
++    fo->rewrite(&segZERO, sizeof(segZERO));
++    fo->rewrite(&segXHDR, sizeof(segXHDR));
++    fo->rewrite(&secXHDR, sizeof(secXHDR));
++    fo->rewrite(&segTEXT, sizeof(segTEXT));
++    fo->rewrite(&secTEXT, sizeof(secTEXT));
++    fo->rewrite(&segLINK, sizeof(segLINK));
++    fo->rewrite(&threado, sizeof(threado));
++    if (my_filetype==Mach_header::MH_EXECUTE) {
++        fo->rewrite(&uuid_cmd, sizeof(uuid_cmd));
++        fo->rewrite(&linkitem, sizeof(linkitem));
++    }
++    fo->rewrite(&linfo, sizeof(linfo));
++}
++
+ void PackMachI386::pack4(OutputFile *fo, Filter &ft)  // append PackHeader
+ {
+     // offset of p_info in compressed file
+@@ -850,6 +947,11 @@ void PackDylibPPC32::pack4(OutputFile *f
+     pack4dylib(fo, ft, threado.state.srr0);
+ }
+ 
++void PackDylibPPC64::pack4(OutputFile *fo, Filter &ft)  // append PackHeader
++{
++    pack4dylib(fo, ft, threado.state.srr0);
++}
++
+ void PackMachPPC32::pack3(OutputFile *fo, Filter &ft)  // append loader
+ {
+     TE32 disp;
+@@ -864,6 +966,20 @@ void PackMachPPC32::pack3(OutputFile *fo
+     super::pack3(fo, ft);
+ }
+ 
++void PackMachPPC64::pack3(OutputFile *fo, Filter &ft)  // append loader
++{
++    TE32 disp;
++    unsigned const zero = 0;
++    unsigned len = fo->getBytesWritten();
++    fo->write(&zero, 3& (0u-len));
++    len += (3& (0u-len));
++    disp = len - sz_mach_headers;
++    fo->write(&disp, sizeof(disp));
++
++    threado.state.srr0 = len + segTEXT.vmaddr;  /* entry address */
++    super::pack3(fo, ft);
++}
++
+ void PackMachI386::pack3(OutputFile *fo, Filter &ft)  // append loader
+ {
+     TE32 disp;
+@@ -979,6 +1095,34 @@ void PackDylibPPC32::pack3(OutputFile *f
+     sz_mach_headers = save_sz_mach_headers;
+ }
+ 
++void PackDylibPPC64::pack3(OutputFile *fo, Filter &ft)  // append loader
++{
++    TE32 disp;
++    TE64 disp64;
++    unsigned const zero = 0;
++    unsigned len = fo->getBytesWritten();
++    fo->write(&zero, 7& (0u-len));
++    len += (7& (0u-len)) + sizeof(disp64) + 4*sizeof(disp);
++
++    disp64= len;
++    fo->write(&disp64, sizeof(disp64));  // __mod_init_func
++
++    disp = prev_init_address;
++    fo->write(&disp, sizeof(disp));  // user .init_address
++
++    disp = sizeof(mhdro) + mhdro.sizeofcmds + sizeof(l_info) + sizeof(p_info);
++    fo->write(&disp, sizeof(disp));  // src offset(compressed __TEXT)
++
++    disp = len - disp - 3*sizeof(disp);
++    fo->write(&disp, sizeof(disp));  // length(compressed __TEXT)
++
++    unsigned const save_sz_mach_headers(sz_mach_headers);
++    sz_mach_headers = 0;
++    super::pack3(fo, ft);
++    sz_mach_headers = save_sz_mach_headers;
++}
++
++
+ // Determine length of gap between PT_LOAD phdri[k] and closest PT_LOAD
+ // which follows in the file (or end-of-file).  Optimize for common case
+ // where the PT_LOAD are adjacent ascending by .p_offset.  Assume no overlap.
+@@ -1126,6 +1270,17 @@ void PackMachPPC32::pack1_setup_threado(
+     fo->write(&threado, sizeof(threado));
+ }
+ 
++void PackMachPPC64::pack1_setup_threado(OutputFile *const fo)
++{
++    threado.cmd = Mach_segment_command::LC_UNIXTHREAD;
++    threado.cmdsize = sizeof(threado);
++    threado.flavor = my_thread_flavor;
++    threado.count =  my_thread_state_word_count;
++    memset(&threado.state, 0, sizeof(threado.state));
++    fo->write(&threado, sizeof(threado));
++}
++
++
+ void PackMachI386::pack1_setup_threado(OutputFile *const fo)
+ {
+     threado.cmd = Mach_segment_command::LC_UNIXTHREAD;
+@@ -1528,6 +1683,25 @@ void PackMachFat::pack(OutputFile *fo)
+                 packer.pack(fo);
+             }
+         } break;
++        case PackMachFat::CPU_TYPE_POWERPC64: {
++            typedef N_Mach::Mach_header<MachClass_LE64::MachITypes> Mach_header;
++            Mach_header hdr;
++            fi->readx(&hdr, sizeof(hdr));
++            if (hdr.filetype==Mach_header::MH_EXECUTE) {
++                PackMachAMD64 packer(fi);
++                packer.initPackHeader();
++                packer.canPack();
++                packer.updatePackHeader();
++                packer.pack(fo);
++            }
++            else if (hdr.filetype==Mach_header::MH_DYLIB) {
++                PackDylibPPC64 packer(fi);
++                packer.initPackHeader();
++                packer.canPack();
++                packer.updatePackHeader();
++                packer.pack(fo);
++            }
++        } break;
+         }  // switch cputype
+         fat_head.arch[j].offset = base;
+         length = fo->unset_extent();
+@@ -1613,6 +1787,23 @@ void PackMachFat::unpack(OutputFile *fo)
+                 packer.unpack(fo);
+             }
+         } break;
++        case PackMachFat::CPU_TYPE_POWERPC64: {
++            N_Mach::Mach_header<MachClass_LE64::MachITypes> hdr;
++            typedef N_Mach::Mach_header<MachClass_LE64::MachITypes> Mach_header;
++            fi->readx(&hdr, sizeof(hdr));
++            if (hdr.filetype==Mach_header::MH_EXECUTE) {
++                PackMachPPC64 packer(fi);
++                packer.initPackHeader();
++                packer.canUnpack();
++                packer.unpack(fo);
++            }
++            else if (hdr.filetype==Mach_header::MH_DYLIB) {
++                PackDylibPPC64 packer(fi);
++                packer.initPackHeader();
++                packer.canUnpack();
++                packer.unpack(fo);
++            }
++        } break;
+         }  // switch cputype
+         fat_head.arch[j].offset = base;
+         length = (fo ? fo->unset_extent() : 0);
+@@ -1667,6 +1858,14 @@ bool PackMachFat::canPack()
+                     return false;
+             }
+         } break;
++        case PackMachFat::CPU_TYPE_POWERPC64: {
++            PackMachPPC64 packer(fi);
++            if (!packer.canPack()) {
++                PackDylibPPC64 pack2r(fi);
++                if (!pack2r.canPack())
++                    return false;
++            }
++        } break;
+         }  // switch cputype
+     }
+ 
+@@ -1724,6 +1923,18 @@ int PackMachFat::canUnpack()
+                 if (!pack2r.canUnpack())
+                     return 0;
+                 else
++                    ph.format = pack2r.getFormat(); // FIXME: copy entire PackHeader
++            }
++            else
++                ph.format = packer.getFormat(); // FIXME: copy entire PackHeader
++        } break;
++        case PackMachFat::CPU_TYPE_POWERPC64: {
++            PackMachPPC64 packer(fi);
++            if (!packer.canUnpack()) {
++                PackDylibPPC64 pack2r(fi);
++                if (!pack2r.canUnpack())
++                    return 0;
++                else
+                     ph.format = pack2r.getFormat(); // FIXME: copy entire PackHeader
+             }
+             else
+--- upx-ucl-3.91.orig/src/p_mach.h
++++ upx-ucl-3.91/src/p_mach.h
+@@ -309,6 +309,26 @@ __packed_struct(Mach_ppc_thread_state)
+ __packed_struct_end()
+ 
+ template <class TMachITypes>
++__packed_struct(Mach_ppc_thread_state64)
++    typedef typename TMachITypes::Word Word;
++    typedef typename TMachITypes::Xword Xword;
++
++    Xword srr0;    /* Instruction address register (PC; entry addr) */
++    Xword srr1;    /* Machine state register (supervisor) */
++    Xword  r0, r1, r2, r3, r4, r5, r6, r7;
++    Xword  r8, r9,r10,r11,r12,r13,r14,r15;
++    Xword r16,r17,r18,r19,r20,r21,r22,r23;
++    Xword r24,r25,r26,r27,r28,r29,r30,r31;
++
++    Word cr;        /* Condition register */  // FIXME: Xword?
++    Xword xer;      /* User's integer exception register */
++    Xword lr;       /* Link register */
++    Xword ctr;      /* Count register */
++
++    Word vrsave;    /* Vector Save Register */
++__packed_struct_end()
++
++template <class TMachITypes>
+ __packed_struct(Mach_i386_thread_state)
+     typedef typename TMachITypes::Word Word;
+ 
+@@ -414,6 +434,7 @@ struct MachClass_32
+     typedef N_Mach::Mach_linkedit_data_command<MachITypes> Mach_linkedit_data_command;
+     typedef N_Mach::Mach_uuid_command<MachITypes> Mach_uuid_command;
+     typedef N_Mach::Mach_ppc_thread_state<MachITypes> Mach_ppc_thread_state;
++    typedef N_Mach::Mach_ppc_thread_state64<MachITypes> Mach_ppc_thread_state64;
+     typedef N_Mach::Mach_i386_thread_state<MachITypes> Mach_i386_thread_state;
+     typedef N_Mach::Mach_AMD64_thread_state<MachITypes> Mach_AMD64_thread_state;
+     typedef N_Mach::Mach_ARM_thread_state<MachITypes> Mach_ARM_thread_state;
+@@ -529,6 +550,7 @@ typedef MachClass_LE64::Mach_linkedit_da
+ typedef MachClass_LE64::Mach_uuid_command   MachLE64_uuid_command;
+ 
+ typedef MachClass_BE32::Mach_ppc_thread_state  Mach_ppc_thread_state;
++typedef MachClass_LE32::Mach_ppc_thread_state64  Mach_ppc_thread_state64;
+ typedef MachClass_LE32::Mach_i386_thread_state Mach_i386_thread_state;
+ typedef MachClass_LE32::Mach_AMD64_thread_state  Mach_AMD64_thread_state;  // FIXME  LE32 vs AMD64
+ typedef MachClass_LE32::Mach_ARM_thread_state  Mach_ARM_thread_state;
+@@ -707,6 +729,56 @@ protected:
+     virtual void buildLoader(const Filter *ft);
+ };
+ 
++class PackMachPPC64 : public PackMachBase<MachClass_LE64>
++{
++    typedef PackMachBase<MachClass_LE64> super;
++
++public:
++    PackMachPPC64(InputFile *f);
++
++    virtual int getFormat() const { return UPX_F_MACH_PPC64; }
++    virtual const char *getName() const { return "Mach/PPC64"; }
++    virtual const char *getFullName(const options_t *) const { return "PPC64-darwin.macho"; }
++protected:
++    virtual const int *getFilters() const;
++
++    virtual void pack1_setup_threado(OutputFile *const fo);
++    virtual void pack3(OutputFile *, Filter &);  // append loader
++    virtual void pack4(OutputFile *, Filter &);  // append PackHeader
++    virtual Linker* newLinker() const;
++    virtual void buildLoader(const Filter *ft);
++    virtual void addStubEntrySections(Filter const *);
++
++    __packed_struct(Mach_thread_command)
++        LE32 cmd;            /* LC_THREAD or  LC_UNIXTHREAD */
++        LE32 cmdsize;        /* total size of this command */
++        LE32 flavor;
++        LE32 count;          /* sizeof(following_thread_state)/4 */
++        Mach_ppc_thread_state64 state;
++    #define WANT_MACH_THREAD_ENUM 1
++    #include "p_mach_enum.h"
++    __packed_struct_end()
++
++    Mach_thread_command threado;
++};
++
++class PackDylibPPC64 : public PackMachPPC64
++{
++    typedef PackMachPPC64 super;
++
++public:
++    PackDylibPPC64(InputFile *f);
++
++    virtual int getFormat() const { return UPX_F_DYLIB_PPC64; }
++    virtual const char *getName() const { return "Dylib/PPC64"; }
++    virtual const char *getFullName(const options_t *) const { return "PPC64-darwin.dylib"; }
++protected:
++    virtual void pack3(OutputFile *, Filter &);  // append loader
++    virtual void pack4(OutputFile *, Filter &);  // append PackHeader
++    virtual void buildLoader(const Filter *ft);
++};
++
++
+ class PackMachI386 : public PackMachBase<MachClass_LE32>
+ {
+     typedef PackMachBase<MachClass_LE32> super;
+--- upx-ucl-3.91.orig/src/packer.cpp
++++ upx-ucl-3.91/src/packer.cpp
+@@ -66,7 +66,7 @@ void Packer::assertPacker() const
+     assert(getFormat() <= 255);
+     assert(getVersion() >= 11);
+     assert(getVersion() <= 14);
+-    assert(strlen(getName()) <= 13);
++    assert(strlen(getName()) <= 15);
+     // info: 32 is limit for show_all_packers() in help.cpp
+     assert(strlen(getFullName(opt)) <= 28);
+     assert(strlen(getFullName(NULL)) <= 28);
+--- upx-ucl-3.91.orig/src/packer_c.cpp
++++ upx-ucl-3.91/src/packer_c.cpp
+@@ -210,13 +210,14 @@ const char *Packer::getDecompressorSecti
+         ||  UPX_F_LINUX_ELF64_AMD  ==ph.format
+         ||  UPX_F_LINUX_ELF32_ARMEL==ph.format
+         ||  UPX_F_LINUX_ELFPPC32   ==ph.format
++        ||  UPX_F_LINUX_ELFPPC64   ==ph.format
+         ||  UPX_F_LINUX_ELF32_ARMEB==ph.format
+         ||  UPX_F_BSD_ELF_i386     ==ph.format
+         ||  UPX_F_VMLINUZ_ARMEL    ==ph.format
+         ||  UPX_F_VMLINUX_ARMEL    ==ph.format
+         ||  UPX_F_VMLINUX_ARMEB    ==ph.format
+         ||  UPX_F_VMLINUX_PPC32    ==ph.format
+-        ||  UPX_F_MACH_PPC32       ==ph.format
++        ||  UPX_F_MACH_PPC64       ==ph.format
+         ||  UPX_F_MACH_i386        ==ph.format
+         ||  UPX_F_DYLIB_i386       ==ph.format
+     ) {
+@@ -250,13 +251,14 @@ void Packer::defineDecompressorSymbols()
+     ||  UPX_F_LINUX_ELF64_AMD  ==ph.format
+     ||  UPX_F_LINUX_ELF32_ARMEL==ph.format
+     ||  UPX_F_LINUX_ELFPPC32   ==ph.format
++    ||  UPX_F_LINUX_ELFPPC64   ==ph.format
+     ||  UPX_F_LINUX_ELF32_ARMEB==ph.format
+     ||  UPX_F_BSD_ELF_i386     ==ph.format
+     ||  UPX_F_VMLINUZ_ARMEL    ==ph.format
+     ||  UPX_F_VMLINUX_ARMEL    ==ph.format
+     ||  UPX_F_VMLINUX_ARMEB    ==ph.format
+     ||  UPX_F_VMLINUX_PPC32    ==ph.format
+-    ||  UPX_F_MACH_PPC32       ==ph.format
++    ||  UPX_F_MACH_PPC64       ==ph.format
+     ||  UPX_F_MACH_i386        ==ph.format
+     ||  UPX_F_DYLIB_i386       ==ph.format
+     ) {
+--- upx-ucl-3.91.orig/src/packmast.cpp
++++ upx-ucl-3.91/src/packmast.cpp
+@@ -277,6 +277,9 @@ Packer* PackMaster::visitAllPackers(visi
+         if ((p = func(new PackLinuxElf32ppc(f), user)) != NULL)
+             return p;
+         delete p; p = NULL;
++        if ((p = func(new PackLinuxElf64ppc(f), user)) != NULL)
++            return p;
++        delete p; p = NULL;
+         if ((p = func(new PackLinuxElf32mipsel(f), user)) != NULL)
+             return p;
+         delete p; p = NULL;
+@@ -318,6 +321,9 @@ Packer* PackMaster::visitAllPackers(visi
+     if ((p = func(new PackMachPPC32(f), user)) != NULL)
+         return p;
+     delete p; p = NULL;
++    if ((p = func(new PackMachPPC64(f), user)) != NULL)
++        return p;
++    delete p; p = NULL;
+     if ((p = func(new PackMachI386(f), user)) != NULL)
+         return p;
+     delete p; p = NULL;
